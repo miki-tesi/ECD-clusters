@@ -1,5 +1,5 @@
 ---
-title: 'HCPC on ECD patient data: round two'
+title: 'HCPC on ECD patient data'
 author: "Michelangelo Tesi"
 date: "`r Sys.Date()`"
 output:
