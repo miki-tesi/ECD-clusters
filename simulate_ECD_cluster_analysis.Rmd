@@ -1,0 +1,990 @@
+---
+title: 'HCPC on ECD patient data: round two'
+author: "Michelangelo Tesi"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Simulate the dataset and load the libraries
+```{r}
+rm(list=ls())
+library(magrittr)
+library(visdat)
+library(FactoMineR)
+library(factoextra)
+library(cluster)
+library(missMDA)
+library(dplyr)
+library(stringr)
+
+set.seed(43)
+n <- 661  # number of patients
+
+# Create organ involvement and overlap disorders (no missingness)
+generate_binary <- function(p) rbinom(n, 1, p)
+ECDpatients <- data.frame(
+  Associated_LCH = generate_binary(0.124),
+  Associated_RDD = generate_binary(0.027),
+  Long_Bone = generate_binary(0.847),
+  Central_Nervous_System = generate_binary(0.419),
+  Facial_or_Orbits = generate_binary(0.403),
+  Heart = generate_binary(0.420),
+  Large_Vessels = generate_binary(0.515),
+  Lungs = generate_binary(0.295),
+  Perirenal_or_Periadrenal = generate_binary(0.669),
+  Skin = generate_binary(0.315),
+  Hypothalamic_or_Pituitary = generate_binary(0.261),
+  Testis = generate_binary(0.039),
+  Lymph_Nodes = generate_binary(0.070),
+  Digestive_Tract = generate_binary(0.083),
+  Hematologic_Malignancy = generate_binary(0.086),
+  Other_Organ_Involvement = generate_binary(0.057)
+)
+
+# Add mutation status: mutually exclusive, with missingness
+mut_status <- sample(c("BRAF", "MAP2K1", "Other", NA), size = n, replace = TRUE,
+                     prob = c(0.617, 0.070, 0.091, 0.222))
+ECDpatients$BRAFV600E_Status <- as.integer(mut_status == "BRAF")
+ECDpatients$MAP2K1_Status <- as.integer(mut_status == "MAP2K1")
+ECDpatients$Other_Mutations <- as.integer(mut_status == "Other")
+
+# Demographics and risk factors, with light missingness (5-10%)
+add_missing <- function(vec, p) {
+  vec[sample(seq_along(vec), size = floor(p * length(vec)))] <- NA
+  vec
+}
+
+ECDpatients$Years_At_Diagnosis <- add_missing(round(rnorm(n, mean = 55, sd = 15)), 0.05)
+ECDpatients$Sex <- add_missing(sample(c("M", "F"), n, replace = TRUE, prob = c(0.65, 0.35)), 0.02)
+ECDpatients$Smoking <- add_missing(sample(0:2, n, replace = TRUE, prob = c(0.5, 0.4, 0.1)), 0.1)
+ECDpatients$Diabetes_Mellitus <- add_missing(generate_binary(0.2), 0.05)
+ECDpatients$Obesity <- add_missing(generate_binary(0.3), 0.05)
+ECDpatients$Hypercholesterolemia <- add_missing(generate_binary(0.35), 0.05)
+ECDpatients$Hypertension <- add_missing(generate_binary(0.4), 0.05)
+ECDpatients$Coronary_Artery_Disease <- add_missing(generate_binary(0.15), 0.05)
+
+# Therapy names pool from your data
+therapies <- c("none", "IFN-alpha", "BRAF-i", "MEK-i", "anti-IL1", "chemotherapy", 
+               "methotrexate", "corticosteroids", "other", "BRAF-i + MEK-i", "BRAF-i + anti-IL1")
+
+# First-Line Therapy
+ECDpatients$First_Line_Therapy <- sample(therapies, n, replace = TRUE,
+                                          prob = c(0.1, 0.35, 0.14, 0.10, 0.05, 0.1, 0.03, 0.05, 0.02, 0.03, 0.03))
+
+# Based on first line outcome, model second and third lines
+ECDpatients$Second_Line_Therapy <- ifelse(ECDpatients$First_Line_Therapy == "none",
+                                           "none",
+                                           sample(therapies, n, replace = TRUE,
+                                                  prob = c(0.4, 0.15, 0.1, 0.1, 0.05, 0.07, 0.02, 0.05, 0.02, 0.02, 0.02)))
+
+ECDpatients$Third_Line_Therapy <- ifelse(ECDpatients$Second_Line_Therapy == "none",
+                                          "none",
+                                          sample(therapies, n, replace = TRUE,
+                                                 prob = c(0.6, 0.1, 0.08, 0.08, 0.05, 0.05, 0.01, 0.02, 0.005, 0.005, 0.005)))
+
+# Simulate therapy responses (NA if therapy not received)
+simulate_response <- function(therapy_col) {
+  sapply(therapy_col, function(x) {
+    if (x == "none") return(NA)
+    if (x %in% c("IFN-alpha", "IFN-alpha + anti-IL1")) return(sample(c("Response", "Stable", "Progression"), 1, prob=c(0.29, 0.4, 0.31)))
+    if (grepl("BRAF", x)) return(sample(c("Response", "Stable", "Progression"), 1, prob=c(0.72, 0.2, 0.08)))
+    if (grepl("MEK", x)) return(sample(c("Response", "Stable", "Progression"), 1, prob=c(0.62, 0.25, 0.13)))
+    if (x == "anti-IL1") return(sample(c("Response", "Stable", "Progression"), 1, prob=c(0.25, 0.4, 0.35)))
+    else return(sample(c("Response", "Stable", "Progression"), 1, prob=c(0.3, 0.4, 0.3)))
+  })
+}
+
+ECDpatients$Response_To_First_Line_Therapy <- simulate_response(ECDpatients$First_Line_Therapy)
+ECDpatients$Response_To_Second_Line_Therapy <- simulate_response(ECDpatients$Second_Line_Therapy)
+ECDpatients$Response_To_Third_Line_Therapy <- simulate_response(ECDpatients$Third_Line_Therapy)
+
+# Overall survival
+ECDpatients$Overall_Survival_in_months <- add_missing(round(rweibull(n, shape=1.7, scale=60)), 0.1)
+ECDpatients$Status_At_Last_Followup <- sample(c(0, 1), n, replace=TRUE, prob=c(0.8, 0.2))
+
+# Check results
+str(ECDpatients)
+```
+
+## Prepare the dataset and load the libraries
+```{r}
+# Add a "Male Sex" variable
+ECDpatients$male_sex <- case_when(ECDpatients$Sex == "M" ~ 1, ECDpatients$Sex == "F" ~ 0)
+
+# Add a "normalized age-at-diagnosis" variable
+ECDpatients$scaled_age <- scale(ECDpatients$Years_At_Diagnosis)
+
+# Add an "age ≥ median" variable
+median_age <- median(ECDpatients$Years_At_Diagnosis, na.rm = TRUE)
+ECDpatients$age_over_median <- ECDpatients$Years_At_Diagnosis >= median_age 
+
+# Add an overall survival in years
+ECDpatients$Overall_Survival_in_years <- ECDpatients$Overall_Survival_in_months / 12
+
+# Equate former smokers to current smokers
+ECDpatients$Smoking <- gsub("2","1", ECDpatients$Smoking) |> as.numeric() 
+
+# Make a cardiovascular risk score variable
+CardiovRisk <- subset(ECDpatients, select=c("Smoking", "Diabetes_Mellitus", "Obesity", "Hypercholesterolemia", "Hypertension", "Coronary_Artery_Disease"))
+for (i in 1:ncol(CardiovRisk)) {
+  CardiovRisk[,i] <- as.factor(CardiovRisk[,i])
+}
+N_Cps <- estim_ncpMCA(CardiovRisk, verbose=FALSE)
+imputedRisk <- imputeMCA(CardiovRisk, ncp=N_Cps$ncp)
+cvRisk <- imputedRisk$tab.disj[,which(colnames(imputedRisk$tab.disj)=="1")] |> as.data.frame()
+colnames(cvRisk) <- colnames(CardiovRisk)
+ECDpatients$Cardiovascular_Risk_Score <- rowSums(cvRisk) 
+
+# Number of organs involved
+ECDpatients$N_of_organs <- ECDpatients[,c("Long_Bone", "Central_Nervous_System", "Facial_or_Orbits", "Heart", "Large_Vessels", "Lungs", "Perirenal_or_Periadrenal", "Skin", "Hypothalamic_or_Pituitary", "Testis", "Lymph_Nodes", "Digestive_Tract", "Other_Organ_Involvement")] |> apply(1, sum, na.rm=TRUE)
+
+# Assume that if BRAFV600E was not tested (i.e. it's missing) then no other mutation was tested too
+# ECDpatients$MAP2K1_Status <- ifelse(is.na(ECDpatients$BRAFV600E_Status), NA, ECDpatients$MAP2K1_Status)
+# ECDpatients$Other_Mutations <- ifelse(is.na(ECDpatients$BRAFV600E_Status), NA, ECDpatients$Other_Mutations)
+
+```
+
+# Make some statistics on the therapies:
+```{r}
+# Did the patient receive IFN-alpha either as first, second or third line therapy? And what about BRAF-i?
+ECDpatients$IFNalpha <- cbind(ECDpatients$First_Line_Therapy %in% c("IFN-alpha","IFN-alpha + anti-IL1"), ECDpatients$Second_Line_Therapy=="IFN-alpha", ECDpatients$Third_Line_Therapy=="IFN-alpha") |> apply(1,any,na.rm=TRUE)
+
+ECDpatients$BRAFi <- cbind(ECDpatients$First_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1"), ECDpatients$Second_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "BRAF-i + HQL"), ECDpatients$Third_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i")) |> apply(1,any,na.rm=TRUE)
+
+ECDpatients$MEKi <- cbind(ECDpatients$First_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1"), ECDpatients$Second_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1"), ECDpatients$Third_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1")) |> apply(1,any,na.rm=TRUE)
+
+# If the patient received IFN-alpha, did he respond? And what about BRAF-i and MEK-i?
+ECDpatients$IFNalpha_Response <- ifelse(
+  ECDpatients$IFNalpha, 
+  case_when(
+    ECDpatients$First_Line_Therapy %in% c("IFN-alpha","IFN-alpha + anti-IL1") ~ ECDpatients$Response_To_First_Line_Therapy == "Response", 
+    ECDpatients$Second_Line_Therapy == "IFN-alpha" ~ ECDpatients$Response_To_Second_Line_Therapy == "Response", 
+    ECDpatients$Third_Line_Therapy == "IFN-alpha" ~ ECDpatients$Response_To_Third_Line_Therapy == "Response"), 
+  NA)
+
+ECDpatients$BRAFi_Response <- ifelse(
+  ECDpatients$BRAFi,
+  case_when(ECDpatients$First_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1") ~ ECDpatients$Response_To_First_Line_Therapy == "Response",
+            ECDpatients$Second_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "BRAF-i + HQL") ~ ECDpatients$Response_To_Second_Line_Therapy == "Response",
+            ECDpatients$Third_Line_Therapy %in% c("BRAF-i","BRAF-i + MEK-i") ~ ECDpatients$Response_To_Third_Line_Therapy == "Response"),
+  NA
+)
+
+ECDpatients$MEKi_Response <- ifelse(
+  ECDpatients$MEKi,
+  case_when(ECDpatients$First_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_First_Line_Therapy == "Response",
+            ECDpatients$Second_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_Second_Line_Therapy == "Response",
+            ECDpatients$Third_Line_Therapy %in% c("MEK-i", "BRAF-i + MEK-i", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_Third_Line_Therapy == "Response"),
+  NA)
+
+# Did the patient receive either IFN-alpha or BRAF-i?
+ECDpatients$IFNalpha_or_BRAFi <- cbind(ECDpatients$First_Line_Therapy %in% c("IFN-alpha", "IFN-alpha + anti-IL1", "BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1"), ECDpatients$Second_Line_Therapy %in% c("IFN-alpha","BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "BRAF-i + HQL"), ECDpatients$Third_Line_Therapy %in% c("IFN-alpha","BRAF-i","BRAF-i + MEK-i")) |> apply(1,any,na.rm=TRUE)
+
+# If the patient received either IFN-alpha or BRAF-i, did he respond to at least one of the two?
+ECDpatients$IFNalpha_or_BRAFi_Response <- ifelse(
+  ECDpatients$IFNalpha_or_BRAFi,
+  case_when(ECDpatients$First_Line_Therapy %in% c("IFN-alpha", "IFN-alpha + anti-IL1", "BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1") ~ ECDpatients$Response_To_First_Line_Therapy=="Response",
+            ECDpatients$Second_Line_Therapy %in% c("IFN-alpha","BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "BRAF-i + HQL") ~ ECDpatients$Response_To_Second_Line_Therapy=="Response",
+            ECDpatients$Third_Line_Therapy %in% c("IFN-alpha", "IFN-alpha + anti-IL1", "BRAF-i","BRAF-i + MEK-i", "BRAF-i + anti-IL1", "BRAF-i + HQL", "methotrexate + IFN-alpha") ~ ECDpatients$Response_To_Third_Line_Therapy == "Response" ),
+  NA
+)
+
+# Has the patient received either BRAF-i or MEK-i?
+ECDpatients$BRAFi_or_MEKi <- cbind(ECDpatients$First_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL"), ECDpatients$Second_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL"), ECDpatients$Third_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL")) |> apply(1,any,na.rm=TRUE)
+
+# If the patient received either BRAF-i or MEK-i, did he respond to at least one of the two?
+ECDpatients$BRAFi_or_MEKi_Response <- ifelse(
+  ECDpatients$BRAFi_or_MEKi,
+  case_when(ECDpatients$First_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL") ~ ECDpatients$Response_To_First_Line_Therapy=="Response",
+            ECDpatients$Second_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL") ~ ECDpatients$Response_To_Second_Line_Therapy=="Response",
+            ECDpatients$Third_Line_Therapy %in% c("MEK-i", "BRAF-i", "BRAF-i + MEK-i", "BRAF-i + anti-IL1", "MEK-i + anti-IL1", "BRAF-i + HQL") ~ ECDpatients$Response_To_Third_Line_Therapy=="Response"),
+  NA)
+
+# Has the patient ever received antiIL1?
+ECDpatients$antiIL1 <- cbind(ECDpatients$First_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1"), ECDpatients$Second_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1"), ECDpatients$Third_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1")) |> apply(1,any,na.rm=TRUE)
+
+# If the patient has ever received antiIL1, did he respond? 
+ECDpatients$antiIL1_Response <- ifelse(
+  ECDpatients$antiIL1,
+  case_when(ECDpatients$First_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_First_Line_Therapy=="Response",
+            ECDpatients$Second_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_Second_Line_Therapy=="Response",
+            ECDpatients$Third_Line_Therapy %in% c("anti-IL1", "BRAF-i + anti-IL1", "IFN-alpha + anti-IL1", "MEK-i + anti-IL1") ~ ECDpatients$Response_To_Third_Line_Therapy=="Response"),
+  NA)
+```
+
+
+## Here I perform MCA and HCPC on the subset containing only the chosen variables (organ involvements + mutations + associated histiocytosis):
+```{r}
+originalVars <- ECDpatients[,c("Years_At_Diagnosis",
+                               "Sex",
+                               "Smoking",
+                               "Diabetes_Mellitus",
+                               "Obesity",
+                               "Hypercholesterolemia",
+                               "Hypertension",
+                               "Coronary_Artery_Disease",
+                               "Associated_LCH",
+                               "Associated_RDD",
+                               "Long_Bone",
+                               "Central_Nervous_System",
+                               "Facial_or_Orbits",
+                               "Heart",
+                               "Large_Vessels",
+                               "Lungs",
+                               "Perirenal_or_Periadrenal",
+                               "Skin",
+                               "Hypothalamic_or_Pituitary",
+                               "Testis",
+                               "Lymph_Nodes",
+                               "Digestive_Tract",
+                               "Hematologic_Malignancy",
+                               "Other_Organ_Involvement",
+                               "BRAFV600E_Status",
+                               "MAP2K1_Status",
+                               "Other_Mutations",
+                               "First_Line_Therapy",
+                               "Response_To_First_Line_Therapy",
+                               "Second_Line_Therapy",
+                               "Response_To_Second_Line_Therapy",
+                               "Third_Line_Therapy",
+                               "Response_To_Third_Line_Therapy",
+                               "Overall_Survival_in_months",
+                               "Status_At_Last_Followup")]
+
+# Choose input variables for the MCA/HCPC
+inputDataset <- subset(ECDpatients, select=c("Associated_LCH",
+                                             "Associated_RDD",
+                                             "Long_Bone",
+                                             "Central_Nervous_System",
+                                             "Facial_or_Orbits",
+                                             "Heart",
+                                             "Large_Vessels",
+                                             "Lungs",
+                                             "Perirenal_or_Periadrenal",
+                                             "Skin",
+                                             "Hypothalamic_or_Pituitary",
+                                             "Testis",
+                                             "Lymph_Nodes",
+                                             "Digestive_Tract",
+                                             "Hematologic_Malignancy",
+                                             "Other_Organ_Involvement",
+                                             "BRAFV600E_Status",
+                                             "MAP2K1_Status",
+                                             "Other_Mutations")) 
+
+# Transform variables in factors in order to make them fit for the estim_ncpMCA() function
+for (i in 1:ncol(inputDataset)) {
+  inputDataset[,i] <- as.factor(inputDataset[,i])
+}
+
+# Number of variables in the overall dataset
+ncol(originalVars)
+
+# Number of variables in the input dataset
+ncol(inputDataset)
+
+# Mean and max rate of missing entries across the overall dataset
+mean(rowMeans(is.na(originalVars)))
+max(rowMeans(is.na(originalVars)))
+
+# Mean and max rate of missing entries across the input dataset
+mean(rowMeans(is.na(inputDataset)))
+max(rowMeans(is.na(inputDataset)))
+
+# Estimate the number of components needed for the MCA
+NretainCps <- estim_ncpMCA(inputDataset, verbose=FALSE)
+
+# If only one dimension, then force two dimensions
+if (NretainCps$ncp <2) { NretainCps$ncp <- 2}
+
+# Impute missing values
+imputedDataset <- imputeMCA(inputDataset, ncp=NretainCps$ncp) # remember: imputation of missing data is done in such a way that imputed values have no influence on the construction of the axes
+
+# Perform MCA on the input dataset
+MCAofinputDataset <- MCA(inputDataset, ncp = NretainCps$ncp, tab.disj=imputedDataset$tab.disj, graph=FALSE)
+
+# Let's have a look at the disjunctive table after it has been adjusted in order to assign each category a numerical value that is directly proportional to its rarity (followed by the centering of the point cloud)
+AdjustedDisjTable <- MCAofinputDataset$call$Xtot
+for (i in 1:ncol(AdjustedDisjTable)) {
+  AdjustedDisjTable[,i] <- -1+AdjustedDisjTable[,i]/(sum(AdjustedDisjTable[,i])/nrow(AdjustedDisjTable))
+} 
+# View(AdjustedDisjTable)
+
+# Run Hyerarchical Clustering on Principal Components over the MCA-derived table
+HCPCofinputDataset <- HCPC(MCAofinputDataset, 
+                          kk=Inf, # no pre-partitioning
+                          # nb.clust=3, # impose the desired number of clusters
+                          consol=TRUE,  # If TRUE, a k-means consolidation is performed (consolidation cannot be performed if kk is used and equals a number)
+                          graph=FALSE)
+
+# From the HCPC object, extract the characterization of the clusters
+cluster_catdes <- FactoMineR::catdes(HCPCofinputDataset$desc.var$call$X,
+                                     which(colnames(HCPCofinputDataset$desc.var$call$X)=="clust"))
+
+cluster_colours <- RColorBrewer::brewer.pal(length(cluster_catdes$category), "Set2")
+
+# Plot HCPC outcome
+plot.HCPC(HCPCofinputDataset, choice="tree", tree.barplot = FALSE)
+plot.HCPC(HCPCofinputDataset, choice="bar")
+#par(cex=2, pch = 19)
+plot.HCPC(HCPCofinputDataset, 
+          choice="map", 
+          axes=c(1,2), 
+          ind.names=FALSE, 
+          draw.tree=FALSE, 
+          #legend=FALSE, 
+          col.hab=cluster_colours)
+# HCPCofinputDataset$desc.var$test.chi2 # sorts the categorical variables based on the strength of the association with the cluster variable (chi-square test) 
+
+# Add the cluster variable as a new variable of the original dataset
+ECDpatients$cluster <- HCPCofinputDataset$data.clust$clust 
+
+# Write on a csv
+#write.table(ECDpatients, file = "ECDclusters.csv", quote = FALSE, sep = ";", na = "NA", row.names = FALSE, col.names = TRUE)
+
+# Also, plot the silhouette width:
+# It seems that FactoMineR hands a squared dist to the cluster algorithm. Why? See (https://github.com/cran/FactoMineR)
+silhouette(as.integer(HCPCofinputDataset$data.clust$clust), stats::dist(MCAofinputDataset$ind$coord, method = "euclidean")) |> fviz_silhouette(print.summary=FALSE, palette=cluster_colours)
+
+# Classification Tree
+classification = numeric(length = 0L)
+for (i in 1:nrow(ECDpatients)) {
+  key_variables = ECDpatients[i, c("BRAFV600E_Status", "MAP2K1_Status", "Heart", "Large_Vessels")]
+  key_variables$MAP2K1_Status = !key_variables$MAP2K1_Status
+  if (sum(key_variables, na.rm=TRUE) >= 3) {
+    classification[i] = 1
+  } else {
+    if (sum(ECDpatients[i, c("MAP2K1_Status", "Associated_RDD", "Testis")], na.rm=TRUE) >= 1) {
+      classification[i] = 3
+    } else {
+      classification[i] = 2
+    }
+  }
+}
+
+ECDpatients$classification = classification
+accur_perc = round(100*sum(ECDpatients$cluster == ECDpatients$classification)/nrow(ECDpatients),digits=1)
+print(paste("Accuracy of classification is ", accur_perc, "%", sep=""))
+```
+
+## Cluster-wise assessment of cluster stability:
+```{r}
+# Cluster-wise stability assessment based on Hennig 2007
+performMCA_HCPC <- function(data, ncp = 5, ncp_imputation = NULL, nb_clust = -1) {
+  # Transform variables into factors for MCA
+  for (i in 1:ncol(data)) {
+    data[, i] <- as.factor(data[, i])
+  }
+  # If ncp is not provided, estimate the number of components needed for MCA
+  if (is.null(ncp_imputation)) {
+    NretainCps <- estim_ncpMCA(data, verbose = FALSE)
+    ncp_imputation <- NretainCps$ncp
+  }
+  
+  # Identify and exclude any zero-variance columns (if any)
+  invariants = which(sapply(data, function(col) all(duplicated(col)[-1L])))
+  if (length(invariants) > 0) {data = data[,-invariants]}
+  # Impute missing values
+  imputedData <- imputeMCA(data, ncp = ncp_imputation)
+  # Perform MCA on the dataset
+  MCAdata <- MCA(data, ncp = ncp, tab.disj = imputedData$tab.disj, graph = FALSE)
+  # Perform HCPC on the MCA-derived table
+  HCPCdata <- HCPC(MCAdata, kk = Inf, nb.clust = nb_clust, consol = TRUE, graph = FALSE)
+  # Return the HCPC result
+  return(HCPCdata)
+}
+
+# Set the number of bootstrap samples
+num_samples <- 200
+
+# Initialize a list to store Jaccard similarity coefficients
+jaccard_coeffs <- matrix(nrow = num_samples, ncol = length(unique(HCPCofinputDataset$data.clust$clust)))
+
+for (k in 1:num_samples) {
+  # Sample with replacement from the original dataset
+  bootstrap_indices <- sample(nrow(inputDataset), replace = TRUE)
+  bootstrap_sample <- inputDataset[bootstrap_indices, ]
+  
+  # Perform MCA and HCPC on the bootstrap sample
+  bootstrap_HCPC <- performMCA_HCPC(bootstrap_sample, 
+                                    ncp = NretainCps$ncp,
+                                    nb_clust = length(unique(HCPCofinputDataset$data.clust$clust)),
+                                    ncp_imputation = NretainCps$ncp)
+  
+  # Select the indices of non-duplicated bootstrap observations
+  bootstrap_indices_noDups <- bootstrap_indices[!duplicated(bootstrap_indices)]
+  
+  # From the bootstrap clustering, select only the non-duplicated bootstrap observations
+  bootstrapClustering <- bootstrap_HCPC$data.clust[!duplicated(bootstrap_indices),]$clust
+  bootstrap_clusters <- as.integer(levels(bootstrap_HCPC$data.clust[!duplicated(bootstrap_indices),]$clust))
+  
+  # From the original clustering, select only the non-duplicated bootstrap observations
+  originalClustering <- HCPCofinputDataset$data.clust[bootstrap_indices_noDups,]$clust
+  original_clusters <- as.integer(levels(HCPCofinputDataset$data.clust[bootstrap_indices_noDups,]$clust))
+  Jaccard_matrix = matrix(nrow=max(original_clusters), ncol=max(bootstrap_clusters))
+  for (cluster in original_clusters) {
+    currentCluster <- originalClustering == cluster
+    if (sum(currentCluster) > 0) {
+      for (class in bootstrap_clusters) {
+        currentClass <- bootstrapClustering == class
+        union = currentCluster | currentClass
+        intersection = currentCluster & currentClass
+        Jaccard = sum(intersection) / sum(union)
+        Jaccard_matrix[cluster, class] = Jaccard
+      }
+    }  
+  }
+  clusterJaccardIndexes = apply(Jaccard_matrix, 1, max, na.rm=TRUE)
+  jaccard_coeffs[k, ] <- clusterJaccardIndexes
+}
+
+# Print out the cluster-wise mean Jaccard similarity coefficient
+MeanJaccardCoeffs <- apply(jaccard_coeffs, 2, mean, na.rm=TRUE)
+print(MeanJaccardCoeffs)
+
+```
+
+
+## V-test heatmap preparation:
+```{r}
+# List the names of the positive category for each variable (see 'HCPCofinputDataset$desc.var$call$X') and sort them in preferred order
+all_pos_cat_names <- c(
+  "Other_Mutations=Other_Mutations_1",
+  "MAP2K1_Status=MAP2K1_Status_1",
+  "BRAFV600E_Status=BRAFV600E_Status_1",
+  "Associated_RDD=Associated_RDD_1",
+  "Associated_LCH=Associated_LCH_1",
+  "Hematologic_Malignancy=Hematologic_Malignancy_1",
+  "Other_Organ_Involvement=Other_Organ_Involvement_1",
+  "Digestive_Tract=Digestive_Tract_1",
+  "Lymph_Nodes=Lymph_Nodes_1",
+  "Testis=Testis_1",
+  "Skin=Skin_1",
+  "Perirenal_or_Periadrenal=Perirenal_or_Periadrenal_1",
+  "Lungs=Lungs_1",
+  "Large_Vessels=Large_Vessels_1",
+  "Heart=Heart_1",
+  "Facial_or_Orbits=Facial_or_Orbits_1",
+  "Hypothalamic_or_Pituitary=Hypothalamic_or_Pituitary_1",
+  "Central_Nervous_System=Central_Nervous_System_1",
+  "Long_Bone=Long_Bone_1")
+
+# List the short names for the positive categories, through a for loop
+pos_cat_short_names <- character(length=0)
+
+for (i in 1:length(all_pos_cat_names)) {
+  if (all_pos_cat_names[i]=="Associated_LCH=Associated_LCH_1") {pos_cat_short_names[i] <- "Associated LCH"}
+  if (all_pos_cat_names[i]=="Associated_RDD=Associated_RDD_1") {pos_cat_short_names[i] <- "Associated RDD"}
+  if (all_pos_cat_names[i]=="BRAFV600E_Status=BRAFV600E_Status_1") {pos_cat_short_names[i] <- "BRAF Mutated"}
+  if (all_pos_cat_names[i]=="MAP2K1_Status=MAP2K1_Status_1") {pos_cat_short_names[i] <- "MAP2K1 Mutated"}
+  if (all_pos_cat_names[i]=="Other_Mutations=Other_Mutations_1") {pos_cat_short_names[i] <- "Other Mutation(s)"}
+  if (all_pos_cat_names[i]=="Central_Nervous_System=Central_Nervous_System_1") {pos_cat_short_names[i] <- "Central Nervous System"}
+  if (all_pos_cat_names[i]=="Hypothalamic_or_Pituitary=Hypothalamic_or_Pituitary_1") {pos_cat_short_names[i] <- "Hypothalamic/Pituitary"}
+  if (all_pos_cat_names[i]=="Digestive_Tract=Digestive_Tract_1") {pos_cat_short_names[i] <- "Digestive Tract"}
+  if (all_pos_cat_names[i]=="Facial_or_Orbits=Facial_or_Orbits_1") {pos_cat_short_names[i] <- "Facial/Orbits"}
+  if (all_pos_cat_names[i]=="Heart=Heart_1") {pos_cat_short_names[i] <- "Heart"}
+  if (all_pos_cat_names[i]=="Large_Vessels=Large_Vessels_1") {pos_cat_short_names[i] <- "Large Vessels"}
+  if (all_pos_cat_names[i]=="Long_Bone=Long_Bone_1") {pos_cat_short_names[i] <- "Long bone"}
+  if (all_pos_cat_names[i]=="Lungs=Lungs_1") {pos_cat_short_names[i] <- "Lungs"}
+  if (all_pos_cat_names[i]=="Lymph_Nodes=Lymph_Nodes_1") {pos_cat_short_names[i] <- "Lymph Nodes"}
+  if (all_pos_cat_names[i]=="Hematologic_Malignancy=Hematologic_Malignancy_1") {pos_cat_short_names[i] <- "Hematologic Malignancy"}
+  if (all_pos_cat_names[i]=="Perirenal_or_Periadrenal=Perirenal_or_Periadrenal_1") {pos_cat_short_names[i] <- "Perirenal"}
+  if (all_pos_cat_names[i]=="Skin=Skin_1") {pos_cat_short_names[i] <- "Skin"}
+  if (all_pos_cat_names[i]=="Testis=Testis_1") {pos_cat_short_names[i] <- "Testis"}
+  if (all_pos_cat_names[i]=="Other_Organ_Involvement=Other_Organ_Involvement_1") {pos_cat_short_names[i] <- "Other Organ Involvement"}
+}
+
+# Prepare the structure of the matrix that will be populated with V-test data
+Vtest_matrix <- matrix(nrow=length(all_pos_cat_names), ncol=length(cluster_catdes$category)) 
+row.names(Vtest_matrix) <- pos_cat_short_names
+
+# Populate the matrix with V-test data
+for (i in 1:length(cluster_catdes$category)) {
+  clusterVtest <- cluster_catdes$category[[i]][,5] # P-values for the categories in the current cluster
+  for (j in 1:nrow(Vtest_matrix)) {
+    if (any(all_pos_cat_names[j]==names(clusterVtest))) {
+      Vtest_matrix[j,i] <- clusterVtest[names(clusterVtest)==all_pos_cat_names[j]]} # Set j-th row cell to the V-test for current category/variable
+    else {Vtest_matrix[j,i] <- 0}}}
+
+```
+
+
+## Prepare the data matrix for the radar charts:
+```{r}
+# Prepare the structure of the matrix that will be populated with the category percentages for each cluster
+CatPerc_matrix <- matrix(nrow=length(cluster_catdes$category), ncol=ncol(inputDataset)) 
+colnames(CatPerc_matrix) <- colnames(inputDataset)
+
+# Populate the matrix with the category percentages for each cluster
+for (i in 1:nrow(CatPerc_matrix)) {
+  # Extract a single-cluster dataset (only with the current cluster)
+  single_cluster_dataset <- subset(inputDataset, HCPCofinputDataset$data.clust$clust==i)
+  for (j in 1:ncol(CatPerc_matrix)) {
+    # Fill out j-th column cell with the percentage of the current category in the given cluster
+    column_of_interest <- as.numeric(single_cluster_dataset[,colnames(single_cluster_dataset)[j] ])-1
+    CatPerc_matrix[i,j] <- sum(column_of_interest, na.rm=TRUE)/length(column_of_interest)
+  }
+}
+
+# Make readable cluster names and assign them to 'CatPerc_matrix' rows
+cluster_names <- character(length = 0)
+for (i in 1:length(cluster_catdes$category)) {
+  cluster_name <- paste("Cluster",i)
+  cluster_names <- c(cluster_names, cluster_name)
+}
+row.names(CatPerc_matrix) <- cluster_names
+
+# Compute overall category percentages and add this as a new row in CatPerc_Matrix
+overallPercs = vector(length = ncol(CatPerc_matrix))
+for (i in 1:length(overallPercs)) {
+  column_of_interest <- as.numeric(inputDataset[,i]) - 1
+  overallPercs[i] <- sum(column_of_interest, na.rm = TRUE) / length(column_of_interest) 
+}
+CatPerc_matrix <- rbind(CatPerc_matrix, overallPercs)
+row.names(CatPerc_matrix)[nrow(CatPerc_matrix)] <- "Overall"
+
+# Set range of values for each category by setting minimum and maximum value, i.e. 0% and 100% respectively
+Minimums <- rep(0, ncol(CatPerc_matrix))
+Maximums <- rep(1, ncol(CatPerc_matrix))
+CatPerc_matrix <- rbind(CatPerc_matrix, Minimums, Maximums, deparse.level = 2) |> as.data.frame()
+
+# Re-sort column order as desired
+CatPerc_matrix <- CatPerc_matrix[,c(1,17,3,4,11,6,7,9,8,10,5,12,13,14,15,16,2,18,19)]
+
+# Re-name matrix columns in order the beautify their names
+for (i in 1:ncol(CatPerc_matrix)) {
+  if (colnames(CatPerc_matrix)[i]=="Long_Bone") {colnames(CatPerc_matrix)[i] <- "Long Bone"}
+  if (colnames(CatPerc_matrix)[i]=="Central_Nervous_System") {colnames(CatPerc_matrix)[i] <- "CNS"}
+  if (colnames(CatPerc_matrix)[i]=="Facial_or_Orbits") {colnames(CatPerc_matrix)[i] <- "Facial/Orbits"}
+  if (colnames(CatPerc_matrix)[i]=="Heart") {colnames(CatPerc_matrix)[i] <- "Heart"}
+  if (colnames(CatPerc_matrix)[i]=="Large_Vessels") {colnames(CatPerc_matrix)[i] <- "Large Vessels"}
+  if (colnames(CatPerc_matrix)[i]=="Lungs") {colnames(CatPerc_matrix)[i] <- "Lungs"}
+  if (colnames(CatPerc_matrix)[i]=="Perirenal_or_Periadrenal") {colnames(CatPerc_matrix)[i] <- "Perirenal/Periadrenal"}
+  if (colnames(CatPerc_matrix)[i]=="Skin") {colnames(CatPerc_matrix)[i] <- "Skin"}
+  if (colnames(CatPerc_matrix)[i]=="Hypothalamic_or_Pituitary") {colnames(CatPerc_matrix)[i] <- "Hypothalamic/Pituitary"}
+  if (colnames(CatPerc_matrix)[i]=="Associated_LCH") {colnames(CatPerc_matrix)[i] <- "Asso. LCH"}
+  if (colnames(CatPerc_matrix)[i]=="Associated_RDD") {colnames(CatPerc_matrix)[i] <- "Asso. RDD"}
+  if (colnames(CatPerc_matrix)[i]=="Testis") {colnames(CatPerc_matrix)[i] <- "Testis"}
+  if (colnames(CatPerc_matrix)[i]=="Lymph_Nodes") {colnames(CatPerc_matrix)[i] <- "Lymph Nodes"}
+  if (colnames(CatPerc_matrix)[i]=="Digestive_Tract") {colnames(CatPerc_matrix)[i] <- "Digestive Tract"}
+  if (colnames(CatPerc_matrix)[i]=="Hematologic_Malignancy") {colnames(CatPerc_matrix)[i] <- "Hemat. Malignancy"}
+  if (colnames(CatPerc_matrix)[i]=="Other_Organ_Involvement") {colnames(CatPerc_matrix)[i] <- "Other Organs"}
+  if (colnames(CatPerc_matrix)[i]=="BRAFV600E_Status") {colnames(CatPerc_matrix)[i] <- "BRAF Mutation"}
+  if (colnames(CatPerc_matrix)[i]=="MAP2K1_Status") {colnames(CatPerc_matrix)[i] <- "MAP2K1 Mutations"}
+  if (colnames(CatPerc_matrix)[i]=="Other_Mutations") {colnames(CatPerc_matrix)[i] <- "Other Mutation(s)"}
+}
+```
+
+## Make summary by the clusters:
+```{r}
+library(gtsummary)
+
+# Install bstfun if necessary
+# devtools::install_github("MSKCC-Epi-Bio/bstfun")
+
+table_rows <- c("Years_At_Diagnosis", 
+  "Sex", 
+  "Long_Bone", 
+  "Central_Nervous_System",
+  "Hypothalamic_or_Pituitary",
+  "Facial_or_Orbits",
+  "Heart",
+  "Large_Vessels",
+  "Lungs",
+  "Perirenal_or_Periadrenal",
+  "Skin",
+  "Testis",
+  "Lymph_Nodes",
+  "Digestive_Tract",
+  "Other_Organ_Involvement",
+  "Hematologic_Malignancy",
+  "Associated_LCH",
+  "Associated_RDD",
+  "BRAFV600E_Status",
+  "MAP2K1_Status",
+  "Other_Mutations",
+  "N_of_organs",
+  "Cardiovascular_Risk_Score",
+  "Status_At_Last_Followup",
+  "Overall_Survival_in_years",
+  "IFNalpha",
+  "antiIL1",
+  "BRAFi",
+  "MEKi",
+  "BRAFi_or_MEKi",
+  "IFNalpha_Response",
+  "antiIL1_Response",
+  "BRAFi_Response",
+  "MEKi_Response",
+  "BRAFi_or_MEKi_Response",
+  "cluster")
+
+row_names <- c(Years_At_Diagnosis ~ "Age at diagnosis", 
+               Sex ~ "Sex", 
+               Long_Bone ~ "Long Bones", 
+               Central_Nervous_System ~ "Central Nervous System",
+               Hypothalamic_or_Pituitary ~ "Hypothalamic/Pituitary",
+               Facial_or_Orbits ~ "Facial/Orbits",
+               Heart ~ "Heart",
+               Large_Vessels ~ "Large Vessels",
+               Lungs ~ "Lungs",
+               Perirenal_or_Periadrenal ~ "Perirenal/Periadrenal",
+               Skin ~ "Skin",
+               Testis ~ "Testis",
+               Lymph_Nodes ~ "Lymph Nodes",
+               Digestive_Tract ~ "Digestive Tract",
+               Hematologic_Malignancy ~ "Hematologic Malignancy",
+               Other_Organ_Involvement ~ "Other Organ Involvement",
+               Associated_LCH ~ "Associated LCH",
+               Associated_RDD ~ "Associated RDD",
+               BRAFV600E_Status ~ "BRAF V600E",
+               MAP2K1_Status ~ "MAP2K1",
+               Other_Mutations ~ "Other Mutations",
+               N_of_organs ~ "Number of Organs Involved",
+               Cardiovascular_Risk_Score ~ "Cardiovascular Risk Score",
+               Status_At_Last_Followup ~ "Deaths",
+               Overall_Survival_in_years ~ "Follow-up Duration in years",
+               IFNalpha ~ "Interferon α",
+               antiIL1 ~ "Anti-IL1",
+               BRAFi ~ "BRAF Inhibitor",
+               MEKi ~ "MEK Inhibitor",
+               BRAFi_or_MEKi ~ "BRAF or MEK Inhibitor",
+               IFNalpha_Response ~ "IFNα Response",
+               antiIL1_Response ~ "Anti-IL1 Response",
+               BRAFi_Response ~ "BRAF-i Response",
+               MEKi_Response ~ "MEK-i Response",
+               BRAFi_or_MEKi_Response ~ "BRAF-i or MEK-i Response") 
+
+clusterTable <- tbl_summary(ECDpatients,
+                            include = table_rows,
+                            by="cluster", 
+                            label = row_names,
+                            statistic = list(all_continuous() ~ "{median} ({p25}, {p75})", all_categorical() ~ "{n} / {N} ({p}%)"),
+                            type = list(N_of_organs ~ "continuous"), # Was not recognized as continuous
+                            digits = list(Years_At_Diagnosis ~ c(0,0,0),
+                                          Overall_Survival_in_years ~ c(1,1,1),
+                                          Cardiovascular_Risk_Score ~ c(0,0,0), 
+                                          N_of_organs ~ c(0,0,0)),
+                            missing = "no") |> 
+  add_p(include = -Status_At_Last_Followup) |> 
+  add_overall() |> 
+  modify_spanning_header(update = c("stat_1", "stat_2", "stat_3") ~ "**Cluster**") |>
+  modify_header(update = label ~ "") |>
+  bstfun::add_variable_grouping("Demographics" = c("Years_At_Diagnosis", "Sex"),
+                                "Organ Pattern" = c("Long_Bone", 
+                                                    "Central_Nervous_System",
+                                                    "Hypothalamic_or_Pituitary",
+                                                    "Facial_or_Orbits",
+                                                    "Heart",
+                                                    "Large_Vessels",
+                                                    "Lungs",
+                                                    "Perirenal_or_Periadrenal",
+                                                    "Skin",
+                                                    "Testis",
+                                                    "Lymph_Nodes",
+                                                    "Digestive_Tract",
+                                                    "Other_Organ_Involvement"),
+                                "Concomitant Disorders" = c("Hematologic_Malignancy",
+                                                            "Associated_LCH",
+                                                            "Associated_RDD"),
+                                "Somatic Mutations" = c("BRAFV600E_Status",
+                                               "MAP2K1_Status",
+                                               "Other_Mutations"),
+                                "Disease Extent" = c("N_of_organs", 
+                                                     "Cardiovascular_Risk_Score"),
+                                "Outcome" = c("Status_At_Last_Followup",
+                                              "Overall_Survival_in_years"),
+                                "Therapy at any time" = c("IFNalpha",
+                                                          "antiIL1",
+                                                          "BRAFi",
+                                                          "MEKi",
+                                                          "BRAFi_or_MEKi"),
+                                "Response to Therapy" = c(  "IFNalpha_Response",
+                                                            "antiIL1_Response",
+                                                            "BRAFi_Response",
+                                                            "MEKi_Response",
+                                                            "BRAFi_or_MEKi_Response"))
+```
+
+
+## by-cluster dot plot preparation:
+```{r}
+# by-cluster mean of each variable ----------------------------------------
+
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# List of variables of interest
+variables_of_interest <- c("Associated_LCH",
+                           "Associated_RDD",
+                           "Long_Bone",
+                           "Central_Nervous_System",
+                           "Facial_or_Orbits",
+                           "Heart",
+                           "Large_Vessels",
+                           "Lungs",
+                           "Perirenal_or_Periadrenal",
+                           "Skin",
+                           "Hypothalamic_or_Pituitary",
+                           "Testis",
+                           "Lymph_Nodes",
+                           "Digestive_Tract",
+                           "Hematologic_Malignancy",
+                           "Other_Organ_Involvement",
+                           "BRAFV600E_Status",
+                           "MAP2K1_Status",
+                           "Other_Mutations")
+
+# First, calculate the mean value of each variable by cluster
+means_by_cluster <- ECDpatients |>
+  group_by(cluster) |>
+  summarise(across(all_of(variables_of_interest), mean, na.rm = TRUE))
+
+# Calculate the overall mean for each variable
+overall_means <- ECDpatients |>
+  summarise(across(all_of(variables_of_interest), mean, na.rm = TRUE))
+
+# Now, combine the overall means with the means by cluster
+means_combined <- bind_rows(means_by_cluster, overall_means |> mutate(cluster = "Overall"))
+
+# Beautify the variables' names
+colnames(means_combined)[colnames(means_combined)=="Associated_LCH"] <- "Associated LCH"
+colnames(means_combined)[colnames(means_combined)=="Associated_RDD"] <- "Associated RDD"
+colnames(means_combined)[colnames(means_combined)=="Long_Bone"] <- "Long Bones"
+colnames(means_combined)[colnames(means_combined)=="Central_Nervous_System"] <- "Central Nervous System"
+colnames(means_combined)[colnames(means_combined)=="Facial_or_Orbits"] <- "Facial/Orbits"
+colnames(means_combined)[colnames(means_combined)=="Large_Vessels"] <- "Large Vessels"
+colnames(means_combined)[colnames(means_combined)=="Perirenal_or_Periadrenal"] <- "Perirenal/Periadrenal"
+colnames(means_combined)[colnames(means_combined)=="Hypothalamic_or_Pituitary"] <- "Hypothalamic/Pituitary"
+colnames(means_combined)[colnames(means_combined)=="Lymph_Nodes"] <- "Lymph Nodes"
+colnames(means_combined)[colnames(means_combined)=="Digestive_Tract"] <- "Digestive Tract"
+colnames(means_combined)[colnames(means_combined)=="Hematologic_Malignancy"] <- "Hematologic Malignancy"
+colnames(means_combined)[colnames(means_combined)=="Other_Organ_Involvement"] <- "Other Organ Involvement"
+colnames(means_combined)[colnames(means_combined)=="BRAFV600E_Status"] <- "BRAFV600E Status"
+colnames(means_combined)[colnames(means_combined)=="MAP2K1_Status"] <- "MAP2K1 Status"
+colnames(means_combined)[colnames(means_combined)=="Other_Mutations"] <- "Other Mutation(s)"
+
+
+# Then, reshape the data into long format
+means_long <- pivot_longer(means_combined, 
+                           -cluster, 
+                           names_to = "variable",
+                           values_to = "mean_value")
+
+# Make a dynamic version of cluster labels for plotting
+means_long$cluster <- factor(means_long$cluster, 
+                             levels = c(as.character(1:length(cluster_catdes$category)), "Overall"),
+                             labels = c(cluster_names, "Overall"))
+
+# Reorder levels of the cluster factor
+means_long$cluster <- factor(means_long$cluster, levels = c(cluster_names, "Overall"))
+
+# Define the custom order of variables
+custom_order <- c(
+  "Other Mutation(s)",
+  "MAP2K1 Status",
+  "BRAFV600E Status",
+  "Associated RDD",
+  "Associated LCH",
+  "Hematologic Malignancy",
+  "Other Organ Involvement",  
+  "Digestive Tract", 
+  "Lymph Nodes",
+  "Testis",
+  "Skin", 
+  "Perirenal/Periadrenal",
+  "Lungs",
+  "Large Vessels",
+  "Heart",
+  "Facial/Orbits",
+  "Hypothalamic/Pituitary",
+  "Central Nervous System",
+  "Long Bones"
+)
+
+# Convert variable to factor with custom order
+means_long$variable <- factor(means_long$variable, levels = custom_order)
+
+# Define custom color palette
+cluster_colors <- c(setNames(cluster_colours, cluster_names), "Overall" = "grey")
+
+# Calculate min and max values for each variable
+variable_extremes <- means_long |>
+  group_by(variable) |>
+  summarise(min_value = min(mean_value),
+            max_value = max(mean_value))
+
+```
+
+
+## Survival analysis: 
+```{r}
+library(survival)
+
+km_fit <- survfit(Surv(ECDpatients$Overall_Survival_in_months, ECDpatients$Status_At_Last_Followup)~ ECDpatients$cluster, type="kaplan-meier")
+
+survdiff(Surv(ECDpatients$Overall_Survival_in_months, ECDpatients$Status_At_Last_Followup)~ECDpatients$cluster) # Is the difference between survival functions statistically significant?
+
+# Set the chosen cluster as the reference group
+ECDpatients$cluster <- relevel(ECDpatients$cluster, 2)
+
+cox_model <- coxph(Surv(ECDpatients$Overall_Survival_in_months, ECDpatients$Status_At_Last_Followup)~ ECDpatients$cluster)
+summary(cox_model)
+```
+
+
+## Show stats and charts:
+```{r, results = 'asis'}
+library(ggplot2)
+
+# Print summary by the clusters:
+clusterTable
+
+# Draw the by-cluster dot plot:
+ggplot(means_long, aes(x = mean_value, y = variable, color = cluster)) +
+  geom_segment(data = variable_extremes, aes(x = min_value, xend = max_value, y = variable, yend = variable), color = "grey", size = 1, linetype = "dotted") +  # Add lines connecting leftmost and rightmost dots
+  geom_point(size = ifelse(means_long$cluster == "Overall", 6, 3), alpha = ifelse(means_long$cluster == "Overall", 0.5, 1)) +  # Adjust size and alpha based on cluster
+  labs(x = "Frequency", y = "", color = "Cluster") +
+  scale_color_manual(values = cluster_colors, breaks = names(cluster_colors)) +  # Set custom colors and order
+  theme_minimal() + 
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1))  # Format x-axis labels as percentages
+
+# Tweak the dot plot, assuming it will be exported as a 1600×1500 pixel picture 
+dot_plot <- ggplot(means_long, aes(x = mean_value, y = variable, color = cluster)) +
+  geom_segment(data = variable_extremes, aes(x = min_value, xend = max_value, y = variable, yend = variable), color = "grey", size = 2, linetype = "dotted") +  # Add lines connecting leftmost and rightmost dots
+  geom_point(size = ifelse(means_long$cluster == "Overall", 16, 8), alpha = ifelse(means_long$cluster == "Overall", 0.5, 1)) +  # Adjust size and alpha based on cluster
+  labs(x = "Frequency", y = "", color = "Cluster") +
+  scale_color_manual(values = cluster_colors, breaks = names(cluster_colors)) +  # Set custom colors and order
+  theme_minimal() + 
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +  # Format x-axis labels as percentages
+  theme(text = element_text(size = 40)) + # Set the font size for all text elements
+  guides(color = guide_legend(override.aes = list(size = 7))) # Adjust legend dot size
+
+
+# Draw the heatmap:
+library(ggplot2)
+library(reshape)
+Vtest_matrix_long <- reshape::melt(Vtest_matrix)
+colnames(Vtest_matrix_long) <- c("Category", "Cluster", "V_test")
+
+ggplot(Vtest_matrix_long, aes(y=Category, x=Cluster, fill=V_test)) + 
+  geom_tile() + 
+  scale_fill_gradient2(low="blue", mid="white", high="red")
+
+# Tweak the heatmap, assuming it will be exported as a 1200×1500 pixel picture
+heat_map <- ggplot(Vtest_matrix_long, aes(y=Category, x=Cluster, fill=V_test)) + 
+  geom_tile() + 
+  scale_fill_gradient2(low="blue", mid="white", high="red") + 
+  theme(axis.text.x = element_text(size = 46),    # Adjust font size of x-axis labels
+        axis.text.y = element_text(size = 40),    # Adjust font size of y-axis labels
+        legend.text = element_text(size = 24))   # Adjust font size of legend labels
+
+# Then plot the Kaplan-Meier survival curve:
+library(survminer)
+ggsurvplot(km_fit, data = ECDpatients, 
+           #pval = TRUE, # Add p-values
+           conf.int = FALSE, # Add confidence intervals
+           risk.table = 'nrisk_cumcensor', # Add risk table with both the number at risk and the cumulative number of censored
+           surv.scale = "percent",
+           legend.title = "",
+           censor.size = 3,
+           risk.table.col = "strata",
+           palette = cluster_colours,
+           legend.labs = cluster_names,
+           tables.height = 0.25,
+           xlab = "Time (months)",
+           ylab = "Survival Probability",
+           xlim = c(0, 150),  # Limit x-axis to show data up to the 200-month time point
+           break.time.by = 60,
+           ggtheme = theme_classic()
+           )
+
+# Tweak the plot, assuming it will be exported as a 1300×1500 pixel picture
+km_plot <- ggsurvplot(km_fit, data = ECDpatients, 
+           #pval = TRUE, # Add p-values
+           conf.int = FALSE, # Add confidence intervals
+           risk.table = 'nrisk_cumcensor', # Add risk table
+           surv.scale = "percent",
+           legend.title = "",
+           size = 2,
+           censor.size = 0,
+           risk.table.col = "strata",
+           palette = cluster_colours,
+           legend.labs = cluster_names,
+           tables.height = 0.25,
+           xlab = "Time (months)",
+           ylab = "Survival Probability",
+           risk.table.fontsize = 9,
+           xlim = c(0, 150),  # Limit x-axis to show data up to the 150-month time point
+           break.time.by = 60,
+           ggtheme = theme_classic(base_size = 30)
+           )
+
+```
+
+
+```{r, results='asis', fig.width=9, fig.height=8}
+# Then plot the radars:
+library(fmsb)
+
+for (i in 1:length(cluster_catdes$category)) {
+  cluster_radar <- CatPerc_matrix[c("Maximums", "Minimums", cluster_names[i], "Overall"),]
+  fmsb::radarchart(cluster_radar, 
+                   axistype=1,
+                   pcol=c(scales::alpha(cluster_colours[i], alpha=0.99), "grey"),
+                   pfcol=scales::alpha(cluster_colours[i], alpha=0.5),
+                   pdensity = c(30, 0), # c(100,0)
+                   plwd=c(4,2), # c(4,4) 
+                   lty = c(1,2),
+                   pty = 32,
+                   #vlcex = 2, calcex = 2, # in order to export as a 1600×1500
+                   cglcol="#000000",
+                   axislabcol="#000000")
+}
+
+# Combine all cluster radars along with "Overall"
+all_radar_data <- CatPerc_matrix[c("Maximums", "Minimums", cluster_names, "Overall"),]
+
+# Dynamically build the radar chart components for all clusters + Overall
+n_clusters <- length(cluster_catdes$category)
+
+# Colors for each cluster and Overall
+pcol <- c(scales::alpha(cluster_colours, alpha = 0.99), "grey")
+
+# Fill colors (transparent for clusters, none for Overall)
+pfcol <- c(rep(scales::alpha(cluster_colours, alpha = 0), n_clusters), NA)
+
+# Density, linewidth, and line type
+pdensity <- c(rep(30, n_clusters), 0)
+plwd <- c(rep(4, n_clusters), 2)
+plty <- c(rep(1, n_clusters), 2)
+
+# Select rows for radar chart: Max, Min, all clusters, Overall
+all_radar_rows <- c("Maximums", "Minimums", cluster_names, "Overall")
+all_radar_data <- CatPerc_matrix[all_radar_rows, ]
+
+# Plot the radar
+fmsb::radarchart(all_radar_data, 
+                 axistype = 1,
+                 pcol = pcol,
+                 pfcol = pfcol,
+                 pdensity = pdensity,
+                 plwd = plwd,
+                 plty = plty,
+                 pty = 32,
+                 cglcol = "#000000",
+                 axislabcol = "#000000")
+```
+
+
+
+
+
